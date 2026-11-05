@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maze Dog</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1b1712; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+// ---------- Config ----------
+const TILE = 56;            // pixel size of one maze tile
+const CELLS = 15;           // maze is CELLS x CELLS logical cells (odd so there's a true center)
+const DOG_R = 13;           // dog collision half-size
+const MAX_SPEED = 230;      // px / s
+const ACCEL = 1800;         // px / s^2
+const FRICTION = 10;        // velocity damping when no input
+const PRINT_STEP = 20;      // px travelled between paw prints
+const PRINT_LIFE = 60;      // seconds a paw print lasts
+const MAX_PRINTS = 4000;
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+}
+window.addEventListener("resize", resize);
+resize();
+
+// ---------- Input ----------
+const keys = {};
+window.addEventListener("keydown", e => {
+  if (e.key.startsWith("Arrow")) e.preventDefault();
+  keys[e.key] = true;
+  if (state.won && (e.key === "Enter" || e.key === " ")) newGame();
+});
+window.addEventListener("keyup", e => { keys[e.key] = false; });
+
+// ---------- Maze generation ----------
+// Tile grid: 1 = wall, 0 = floor. Size (2*CELLS+1)^2.
+function generateMaze(n) {
+  const size = 2 * n + 1;
+  const g = Array.from({ length: size }, () => new Array(size).fill(1));
+  const visited = Array.from({ length: n }, () => new Array(n).fill(false));
+  const c = Math.floor(n / 2);
+  const stack = [[c, c]];
+  visited[c][c] = true;
+  g[2 * c + 1][2 * c + 1] = 0;
+  const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  while (stack.length) {
+    const [cx, cy] = stack[stack.length - 1];
+    const opts = dirs.filter(([dx, dy]) => {
+      const nx = cx + dx, ny = cy + dy;
+      return nx >= 0 && ny >= 0 && nx < n && ny < n && !visited[ny][nx];
+    });
+    if (!opts.length) { stack.pop(); continue; }
+    const [dx, dy] = opts[Math.floor(Math.random() * opts.length)];
+    const nx = cx + dx, ny = cy + dy;
+    visited[ny][nx] = true;
+    g[2 * cy + 1 + dy][2 * cx + 1 + dx] = 0;
+    g[2 * ny + 1][2 * nx + 1] = 0;
+    stack.push([nx, ny]);
+  }
+  // A few extra openings so it's not a perfect maze (loops make footprints matter more)
+  for (let i = 0; i < n * 1.5; i++) {
+    const x = 1 + Math.floor(Math.random() * (size - 2));
+    const y = 1 + Math.floor(Math.random() * (size - 2));
+    if (g[y][x] === 1 && ((x % 2 === 1 && y % 2 === 0) || (x % 2 === 0 && y % 2 === 1))) g[y][x] = 0;
+  }
+
+  // Exit: the border cell farthest (by path) from the center
+  const dist = Array.from({ length: size }, () => new Array(size).fill(-1));
+  const sx = 2 * c + 1, sy = 2 * c + 1;
+  const q = [[sx, sy]]; dist[sy][sx] = 0;
+  while (q.length) {
+    const [x, y] = q.shift();
+    for (const [dx, dy] of dirs) {
+      const nx = x + dx, ny = y + dy;
+      if (g[ny] && g[ny][nx] === 0 && dist[ny][nx] < 0) { dist[ny][nx] = dist[y][x] + 1; q.push([nx, ny]); }
+    }
+  }
+  let best = null, bestD = -1;
+  for (let i = 1; i < size - 1; i += 2) {
+    const cand = [
+      { fx: i, fy: 1, ex: i, ey: 0 },
+      { fx: i, fy: size - 2, ex: i, ey: size - 1 },
+      { fx: 1, fy: i, ex: 0, ey: i },
+      { fx: size - 2, fy: i, ex: size - 1, ey: i },
+    ];
+    for (const cd of cand) {
+      const d = dist[cd.fy][cd.fx] + Math.random() * 6; // a little randomness among far candidates
+      if (d > bestD) { bestD = d; best = cd; }
+    }
+  }
+  g[best.ey][best.ex] = 2; // 2 = exit tile
+  return { grid: g, size, start: { x: sx, y: sy }, exit: { x: best.ex, y: best.ey } };
+}
+
+// ---------- Game state ----------
+let maze, dog, prints, cam, state, time;
+
+function newGame() {
+  maze = generateMaze(CELLS);
+  dog = {
+    x: (maze.start.x + 0.5) * TILE, y: (maze.start.y + 0.5) * TILE,
+    vx: 0, vy: 0, angle: -Math.PI / 2,
+    walk: 0, distSincePrint: 0, side: 1, tail: 0,
+  };
+  prints = [];
+  cam = { x: dog.x, y: dog.y };
+  state = { won: false, elapsed: 0, wonAt: 0 };
+  time = 0;
+}
+
+function isWall(tx, ty) {
+  if (ty < 0 || tx < 0 || ty >= maze.size || tx >= maze.size) return false; // outside = open (past the exit)
+  return maze.grid[ty][tx] === 1;
+}
+
+// Box vs tile collision, resolved one axis at a time
+function moveAxis(dx, dy) {
+  dog.x += dx; dog.y += dy;
+  const minTX = Math.floor((dog.x - DOG_R) / TILE), maxTX = Math.floor((dog.x + DOG_R) / TILE);
+  const minTY = Math.floor((dog.y - DOG_R) / TILE), maxTY = Math.floor((dog.y + DOG_R) / TILE);
+  for (let ty = minTY; ty <= maxTY; ty++) {
+    for (let tx = minTX; tx <= maxTX; tx++) {
+      if (!isWall(tx, ty)) continue;
+      if (dx > 0) dog.x = tx * TILE - DOG_R - 0.01;
+      if (dx < 0) dog.x = (tx + 1) * TILE + DOG_R + 0.01;
+      if (dy > 0) dog.y = ty * TILE - DOG_R - 0.01;
+      if (dy < 0) dog.y = (ty + 1) * TILE + DOG_R + 0.01;
+      if (dx) dog.vx = 0;
+      if (dy) dog.vy = 0;
+    }
+  }
+}
+
+function update(dt) {
+  time += dt;
+  if (!state.won) state.elapsed += dt;
+
+  let ix = 0, iy = 0;
+  if (!state.won) {
+    if (keys.ArrowLeft) ix -= 1;
+    if (keys.ArrowRight) ix += 1;
+    if (keys.ArrowUp) iy -= 1;
+    if (keys.ArrowDown) iy += 1;
+  }
+  const len = Math.hypot(ix, iy);
+  if (len) {
+    ix /= len; iy /= len;
+    dog.vx += ix * ACCEL * dt;
+    dog.vy += iy * ACCEL * dt;
+    const sp = Math.hypot(dog.vx, dog.vy);
+    if (sp > MAX_SPEED) { dog.vx *= MAX_SPEED / sp; dog.vy *= MAX_SPEED / sp; }
+  } else {
+    const k = Math.exp(-FRICTION * dt);
+    dog.vx *= k; dog.vy *= k;
+  }
+
+  const ox = dog.x, oy = dog.y;
+  moveAxis(dog.vx * dt, 0);
+  moveAxis(0, dog.vy * dt);
+  const moved = Math.hypot(dog.x - ox, dog.y - oy);
+
+  // Face direction of travel (smoothly)
+  if (moved > 0.3) {
+    const target = Math.atan2(dog.y - oy, dog.x - ox);
+    let d = target - dog.angle;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    dog.angle += d * Math.min(1, dt * 14);
+  }
+  dog.walk += moved * 0.12;
+  dog.tail += dt * (moved > 0.3 ? 16 : 6);
+
+  // Paw prints
+  dog.distSincePrint += moved;
+  if (dog.distSincePrint >= PRINT_STEP) {
+    dog.distSincePrint = 0;
+    dog.side *= -1;
+    const px = Math.cos(dog.angle + Math.PI / 2) * 6 * dog.side;
+    const py = Math.sin(dog.angle + Math.PI / 2) * 6 * dog.side;
+    prints.push({ x: dog.x + px, y: dog.y + py, a: dog.angle, t: time });
+    if (prints.length > MAX_PRINTS) prints.shift();
+  }
+  while (prints.length && time - prints[0].t > PRINT_LIFE) prints.shift();
+
+  // Win check: dog standing on the exit tile or beyond the maze edge
+  const tx = Math.floor(dog.x / TILE), ty = Math.floor(dog.y / TILE);
+  if (!state.won && (maze.grid[ty]?.[tx] === 2 || tx < 0 || ty < 0 || tx >= maze.size || ty >= maze.size)) {
+    state.won = true; state.wonAt = time;
+  }
+
+  // Camera follows dog smoothly
+  const ck = 1 - Math.exp(-6 * dt);
+  cam.x += (dog.x - cam.x) * ck;
+  cam.y += (dog.y - cam.y) * ck;
+}
+
+// ---------- Rendering ----------
+function hash(x, y) {
+  let h = x * 374761393 + y * 668265263;
+  h = (h ^ (h >> 13)) * 1274126177;
+  return ((h ^ (h >> 16)) >>> 0) / 4294967295;
+}
+
+function drawFloorTile(tx, ty, x, y) {
+  const v = hash(tx, ty);
+  const base = 196 + Math.floor(v * 14);
+  ctx.fillStyle = `rgb(${base},${base - 22},${base - 52})`;
+  ctx.fillRect(x, y, TILE, TILE);
+  // subtle flagstone seams
+  ctx.strokeStyle = "rgba(90,70,40,0.18)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, TILE - 1, TILE - 1);
+  if (v > 0.8) { // little speckles
+    ctx.fillStyle = "rgba(110,85,50,0.25)";
+    ctx.beginPath(); ctx.arc(x + hash(tx + 7, ty) * TILE, y + hash(tx, ty + 7) * TILE, 2, 0, 7); ctx.fill();
+  }
+}
+
+function drawWallTile(tx, ty, x, y) {
+  // hedge-ish walls with a raised top and shaded south face
+  const v = hash(tx + 99, ty + 41);
+  ctx.fillStyle = "#2f4a26";
+  ctx.fillRect(x, y, TILE, TILE);
+  ctx.fillStyle = `rgb(${60 + v * 12},${98 + v * 18},${48 + v * 10})`;
+  ctx.fillRect(x, y, TILE, TILE - 10);
+  // leafy blobs
+  for (let i = 0; i < 4; i++) {
+    const bx = x + hash(tx * 3 + i, ty) * TILE, by = y + hash(tx, ty * 3 + i) * (TILE - 14);
+    ctx.fillStyle = `rgba(${120 + i * 6},${160 + i * 4},${80},0.35)`;
+    ctx.beginPath(); ctx.arc(bx, by, 6 + i * 1.5, 0, 7); ctx.fill();
+  }
+}
+
+function drawExitTile(x, y) {
+  const pulse = 0.5 + 0.5 * Math.sin(time * 4);
+  ctx.fillStyle = "#d9c68f";
+  ctx.fillRect(x, y, TILE, TILE);
+  const g = ctx.createRadialGradient(x + TILE / 2, y + TILE / 2, 4, x + TILE / 2, y + TILE / 2, TILE);
+  g.addColorStop(0, `rgba(255,240,140,${0.6 + pulse * 0.4})`);
+  g.addColorStop(1, "rgba(255,240,140,0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(x - TILE / 2, y - TILE / 2, TILE * 2, TILE * 2);
+  ctx.fillStyle = "#6b4b1f";
+  ctx.font = "bold 14px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("EXIT", x + TILE / 2, y + TILE / 2);
+}
+
+function drawPaw(p) {
+  const age = time - p.t;
+  const alpha = Math.max(0, 1 - age / PRINT_LIFE) * 0.55;
+  if (alpha <= 0.01) return;
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(p.a + Math.PI / 2);
+  ctx.fillStyle = `rgba(80,52,28,${alpha})`;
+  ctx.beginPath(); ctx.ellipse(0, 1.5, 3.4, 2.8, 0, 0, 7); ctx.fill();
+  for (const [tx, ty] of [[-3.3, -2.2], [-1.1, -4], [1.1, -4], [3.3, -2.2]]) {
+    ctx.beginPath(); ctx.arc(tx, ty, 1.15, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawDog() {
+  const moving = Math.hypot(dog.vx, dog.vy) > 20;
+  ctx.save();
+  ctx.translate(dog.x, dog.y);
+
+  // shadow
+  ctx.fillStyle = "rgba(0,0,0,0.22)";
+  ctx.beginPath(); ctx.ellipse(2, 4, 19, 13, dog.angle, 0, 7); ctx.fill();
+
+  ctx.rotate(dog.angle);
+  ctx.scale(0.85, 0.85);
+  const fur = "#b9773a", furDark = "#8a5426", furLight = "#e0a866";
+
+  // legs (little paws poking out, animated)
+  const s = moving ? Math.sin(dog.walk) * 4 : 0;
+  ctx.fillStyle = furDark;
+  for (const [lx, ly, ph] of [[8, -8, 1], [8, 8, -1], [-8, -8, -1], [-8, 8, 1]]) {
+    ctx.beginPath(); ctx.ellipse(lx + s * ph, ly, 4, 3, 0, 0, 7); ctx.fill();
+  }
+
+  // tail
+  const wag = Math.sin(dog.tail) * 0.6;
+  ctx.save();
+  ctx.translate(-13, 0);
+  ctx.rotate(Math.PI + wag);
+  ctx.strokeStyle = fur; ctx.lineWidth = 4; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.quadraticCurveTo(6, 3, 11, 0); ctx.stroke();
+  ctx.restore();
+
+  // body
+  ctx.fillStyle = fur;
+  ctx.beginPath(); ctx.ellipse(-2, 0, 14, 9, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = furLight;
+  ctx.beginPath(); ctx.ellipse(-3, 0, 8, 4, 0, 0, 7); ctx.fill();
+
+  // head
+  ctx.fillStyle = fur;
+  ctx.beginPath(); ctx.arc(12, 0, 7.5, 0, 7); ctx.fill();
+  // snout
+  ctx.fillStyle = furLight;
+  ctx.beginPath(); ctx.ellipse(18, 0, 4.5, 3.5, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = "#2a1a10";
+  ctx.beginPath(); ctx.arc(22, 0, 1.8, 0, 7); ctx.fill();
+  // ears (flop with walk)
+  const ear = moving ? Math.sin(dog.walk * 2) * 0.25 : 0;
+  ctx.fillStyle = furDark;
+  ctx.save(); ctx.translate(10, -6); ctx.rotate(-0.5 + ear);
+  ctx.beginPath(); ctx.ellipse(-2, -2, 5, 3, 0, 0, 7); ctx.fill(); ctx.restore();
+  ctx.save(); ctx.translate(10, 6); ctx.rotate(0.5 - ear);
+  ctx.beginPath(); ctx.ellipse(-2, 2, 5, 3, 0, 0, 7); ctx.fill(); ctx.restore();
+  // eyes
+  ctx.fillStyle = "#1a120b";
+  ctx.beginPath(); ctx.arc(14.5, -3, 1.2, 0, 7); ctx.arc(14.5, 3, 1.2, 0, 7); ctx.fill();
+  // collar
+  ctx.strokeStyle = "#c0392b"; ctx.lineWidth = 2.2;
+  ctx.beginPath(); ctx.arc(12, 0, 7.5, Math.PI * 0.6, Math.PI * 1.4); ctx.stroke();
+
+  ctx.restore();
+}
+
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#24361d";
+  ctx.fillRect(0, 0, W, H);
+
+  const ox = Math.round(W / 2 - cam.x), oy = Math.round(H / 2 - cam.y);
+  ctx.save();
+  ctx.translate(ox, oy);
+
+  const x0 = Math.floor(-ox / TILE) - 1, y0 = Math.floor(-oy / TILE) - 1;
+  const x1 = Math.ceil((W - ox) / TILE) + 1, y1 = Math.ceil((H - oy) / TILE) + 1;
+
+  // floor + exit
+  for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) {
+    if (ty < 0 || tx < 0 || ty >= maze.size || tx >= maze.size) continue;
+    const t = maze.grid[ty][tx];
+    if (t === 0) drawFloorTile(tx, ty, tx * TILE, ty * TILE);
+    else if (t === 2) drawExitTile(tx * TILE, ty * TILE);
+  }
+
+  // footprints
+  for (const p of prints) {
+    if (p.x < -ox - 20 || p.x > W - ox + 20 || p.y < -oy - 20 || p.y > H - oy + 20) continue;
+    drawPaw(p);
+  }
+
+  // wall shadows on floor, then walls
+  ctx.fillStyle = "rgba(0,0,0,0.18)";
+  for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) {
+    if (isWall(tx, ty)) ctx.fillRect(tx * TILE + 6, ty * TILE + 8, TILE, TILE);
+  }
+
+  for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) {
+    if (isWall(tx, ty)) drawWallTile(tx, ty, tx * TILE, ty * TILE);
+  }
+
+  drawDog();
+  ctx.restore();
+
+  // vignette
+  const vg = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.75);
+  vg.addColorStop(0, "rgba(0,0,0,0)");
+  vg.addColorStop(1, "rgba(0,0,0,0.55)");
+  ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
+
+  // HUD
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
+  ctx.fillRect(12, 12, 170, 34);
+  ctx.fillStyle = "#f3e6c8";
+  ctx.font = "bold 18px sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("Time  " + formatTime(state.elapsed), 24, 29);
+
+  if (time < 6 && !state.won) {
+    ctx.globalAlpha = Math.min(1, 6 - time);
+    ctx.textAlign = "center";
+    ctx.font = "16px sans-serif";
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(W / 2 - 210, H - 60, 420, 34);
+    ctx.fillStyle = "#f3e6c8";
+    ctx.fillText("Arrow keys to move. Find the exit!", W / 2, H - 43);
+    ctx.globalAlpha = 1;
+  }
+
+  if (state.won) {
+    const a = Math.min(1, (time - state.wonAt) * 2);
+    ctx.fillStyle = `rgba(20,15,10,${0.6 * a})`;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = a;
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ffe9a8";
+    ctx.font = "bold 56px sans-serif";
+    ctx.fillText("Good dog!", W / 2, H / 2 - 30);
+    ctx.font = "22px sans-serif";
+    ctx.fillStyle = "#f3e6c8";
+    ctx.fillText("Escaped in " + formatTime(state.elapsed), W / 2, H / 2 + 20);
+    ctx.fillText("Press Enter for a new maze", W / 2, H / 2 + 56);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function formatTime(s) {
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+  return m + ":" + String(sec).padStart(2, "0");
+}
+
+// ---------- Loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+newGame();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
